@@ -1,36 +1,50 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Wix ↔ HubSpot Bi-Directional Sync
 
-## Getting Started
+This is a Full Stack Next.js application that implements a robust, bi-directional sync engine between Wix and HubSpot contacts, alongside a Wix-to-HubSpot form submission integration with full UTM attribution.
 
-First, run the development server:
+## 🚀 Features
 
+*   **Bi-Directional Contact Sync:** Real-time sync between Wix Contacts and HubSpot Contacts.
+*   **Conflict Resolution:** "Last Updated Wins" deterministic conflict handling.
+*   **Infinite Loop Prevention:** Idempotency (SHA-256 state hashing) and 15-second deduplication windows prevent ping-pong syncing.
+*   **Form & Lead Capture:** Syncs Wix Form submissions to HubSpot, automatically capturing and mapping UTM parameters (`utm_source`, `utm_medium`, `utm_campaign`, etc.) and referral URLs.
+*   **Dynamic Field Mapping:** A UI that allows users to map Wix fields to HubSpot properties and apply data transformations (`trim`, `lowercase`).
+*   **Security First:** Uses AES-256-GCM encryption to safely store HubSpot OAuth access and refresh tokens. Strict webhook HMAC signature verification ensures endpoints are secure.
+
+## 🛠️ Setup & Installation
+
+### 1. Prerequisites
+You will need Node.js (v18+) and npm installed. The app uses a local SQLite database (`database.sqlite`) which will be created automatically.
+
+### 2. Environment Variables
+Copy the `.env.example` file to `.env`:
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Fill out the `.env` file. You will need:
+*   A 32+ character random string for `ENCRYPTION_KEY`
+*   HubSpot OAuth App credentials (`HUBSPOT_CLIENT_ID`, `HUBSPOT_CLIENT_SECRET`)
+*   Wix API credentials (`WIX_API_KEY`, `WIX_SITE_ID`, `WIX_WEBHOOK_SECRET`)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+*(Note: For webhooks to work locally, you will need to tunnel your localhost using a tool like `ngrok` and point your Wix/HubSpot webhook configurations to your ngrok URL).*
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### 3. Install Dependencies
+```bash
+npm install
+```
 
-## Learn More
+### 4. Run the Application
+```bash
+npm run dev
+```
+Open [http://localhost:3001](http://localhost:3001) with your browser to view the mapping dashboard and connect your HubSpot account.
 
-To learn more about Next.js, take a look at the following resources:
+## 🧪 Testing
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+This project includes a fast, zero-config `vitest` suite that mathematically verifies the core encryption, idempotency hashing, and webhook signature verification algorithms.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Run the test suite:
+```bash
+npm run test
+```
