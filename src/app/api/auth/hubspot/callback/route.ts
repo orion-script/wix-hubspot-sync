@@ -1,17 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
+import { encrypt } from '@/lib/crypto';
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const code = searchParams.get('code');
-  const state = searchParams.get('state'); // This contains our wixInstanceId
+  const state = searchParams.get('state');
 
-  if (!code || !state) {
-    return NextResponse.json({ error: 'Missing code or state' }, { status: 400 });
-  }
+  if (!code || !state) return NextResponse.json({ error: 'Missing code or state' }, { status: 400 });
 
   const wixInstanceId = decodeURIComponent(state);
-
   const clientId = process.env.HUBSPOT_CLIENT_ID!;
   const clientSecret = process.env.HUBSPOT_CLIENT_SECRET!;
   const redirectUri = process.env.HUBSPOT_REDIRECT_URI!;
@@ -19,15 +17,13 @@ export async function GET(request: NextRequest) {
   try {
     const tokenResponse = await fetch('https://api.hubapi.com/oauth/v1/token', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'authorization_code',
         client_id: clientId,
         client_secret: clientSecret,
         redirect_uri: redirectUri,
-        code: code,
+        code,
       }),
     });
 
@@ -38,26 +34,28 @@ export async function GET(request: NextRequest) {
     }
 
     const tokenData = await tokenResponse.json();
-    const accessToken = tokenData.access_token;
-    const refreshToken = tokenData.refresh_token;
-    const expiresIn = tokenData.expires_in; // in seconds
-    const expiresAt = Date.now() + expiresIn * 1000;
+    const expiresAt = Date.now() + tokenData.expires_in * 1000;
+
+    // Fetch portal info to store portalId for webhook mapping
+    const infoRes = await fetch('https://api.hubapi.com/oauth/v1/access-tokens/' + tokenData.access_token);
+    const infoData = infoRes.ok ? await infoRes.json() : {};
+    const hubspotPortalId = String(infoData.hub_id || '');
 
     const db = await getDb();
-    
-    // UPSERT connection details
+
+    // Store ENCRYPTED tokens — never store plaintext credentials
     await db.run(
-      `INSERT INTO connections (wixInstanceId, hubspotAccessToken, hubspotRefreshToken, hubspotExpiresAt)
-       VALUES (?, ?, ?, ?)
+      `INSERT INTO connections (wixInstanceId, hubspotAccessToken, hubspotRefreshToken, hubspotExpiresAt, hubspotPortalId)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(wixInstanceId) DO UPDATE SET
-       hubspotAccessToken=excluded.hubspotAccessToken,
-       hubspotRefreshToken=excluded.hubspotRefreshToken,
-       hubspotExpiresAt=excluded.hubspotExpiresAt`,
-      [wixInstanceId, accessToken, refreshToken, expiresAt]
+         hubspotAccessToken=excluded.hubspotAccessToken,
+         hubspotRefreshToken=excluded.hubspotRefreshToken,
+         hubspotExpiresAt=excluded.hubspotExpiresAt,
+         hubspotPortalId=excluded.hubspotPortalId`,
+      [wixInstanceId, encrypt(tokenData.access_token), encrypt(tokenData.refresh_token), expiresAt, hubspotPortalId]
     );
 
-    // Redirect to the UI (e.g., closing the popup or redirecting back to Wix dashboard)
-    return NextResponse.redirect(new URL('/dashboard/success', request.url));
+    return NextResponse.redirect(new URL(`/?instanceId=${wixInstanceId}`, request.url));
   } catch (error) {
     console.error('OAuth Callback Error:', error);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });

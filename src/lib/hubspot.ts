@@ -1,8 +1,8 @@
 import { getDb } from './db';
+import { encrypt, decrypt } from './crypto';
 
 const HUBSPOT_CLIENT_ID = process.env.HUBSPOT_CLIENT_ID!;
 const HUBSPOT_CLIENT_SECRET = process.env.HUBSPOT_CLIENT_SECRET!;
-const HUBSPOT_REDIRECT_URI = process.env.HUBSPOT_REDIRECT_URI!;
 
 export async function getHubspotAccessToken(wixInstanceId: string): Promise<string | null> {
   const db = await getDb();
@@ -10,53 +10,48 @@ export async function getHubspotAccessToken(wixInstanceId: string): Promise<stri
     'SELECT hubspotAccessToken, hubspotRefreshToken, hubspotExpiresAt FROM connections WHERE wixInstanceId = ?',
     [wixInstanceId]
   );
-
   if (!row) return null;
 
-  // If token is expired or expiring within 5 minutes, refresh it
+  // Refresh token if expiring within 5 minutes
   if (Date.now() > row.hubspotExpiresAt - 5 * 60 * 1000) {
-    console.log('Refreshing HubSpot token for instance:', wixInstanceId);
-    
+    const decryptedRefresh = decrypt(row.hubspotRefreshToken);
     const response = await fetch('https://api.hubapi.com/oauth/v1/token', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: HUBSPOT_CLIENT_ID,
         client_secret: HUBSPOT_CLIENT_SECRET,
-        refresh_token: row.hubspotRefreshToken,
+        refresh_token: decryptedRefresh,
       }),
     });
 
     if (!response.ok) {
-      console.error('Failed to refresh HubSpot token', await response.text());
+      console.error('Failed to refresh HubSpot token');
       return null;
     }
 
     const data = await response.json();
     const newExpiresAt = Date.now() + data.expires_in * 1000;
-
     await db.run(
-      'UPDATE connections SET hubspotAccessToken = ?, hubspotRefreshToken = ?, hubspotExpiresAt = ? WHERE wixInstanceId = ?',
-      [data.access_token, data.refresh_token, newExpiresAt, wixInstanceId]
+      'UPDATE connections SET hubspotAccessToken=?, hubspotRefreshToken=?, hubspotExpiresAt=? WHERE wixInstanceId=?',
+      [encrypt(data.access_token), encrypt(data.refresh_token), newExpiresAt, wixInstanceId]
     );
-
     return data.access_token;
   }
 
-  return row.hubspotAccessToken;
+  return decrypt(row.hubspotAccessToken);
 }
 
-export async function hubspotApi(wixInstanceId: string, endpoint: string, options: RequestInit = {}) {
+export async function hubspotApi(
+  wixInstanceId: string,
+  endpoint: string,
+  options: RequestInit = {}
+) {
   const token = await getHubspotAccessToken(wixInstanceId);
-  if (!token) {
-    throw new Error('No HubSpot connection found or failed to refresh token');
-  }
+  if (!token) throw new Error('No HubSpot connection found or failed to refresh token');
 
-  const url = `https://api.hubapi.com${endpoint}`;
-  const response = await fetch(url, {
+  const response = await fetch(`https://api.hubapi.com${endpoint}`, {
     ...options,
     headers: {
       ...options.headers,
@@ -64,6 +59,5 @@ export async function hubspotApi(wixInstanceId: string, endpoint: string, option
       'Content-Type': 'application/json',
     },
   });
-
   return response;
 }

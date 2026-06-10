@@ -39,3 +39,12 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# HubSpot config file
+hubspot.config.yml
+
+# Database
+database.sqlite
+
+# Junk
+wix-sync-app/

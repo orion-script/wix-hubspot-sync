@@ -1,93 +1,111 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { hubspotApi } from '@/lib/hubspot';
+import { verifyHmac } from '@/lib/crypto';
 
 export async function POST(request: NextRequest) {
   try {
-    const payload = await request.json();
-    
-    // Wix Form Submit Webhook payload
-    const wixInstanceId = payload.instanceId;
-    const formData = payload.data; // Includes fields, context, etc.
+    const rawBody = await request.text();
+
+        const wixSignature = request.headers.get('x-wix-signature') || '';
+    const wixWebhookSecret = process.env.WIX_WEBHOOK_SECRET || '';
+    if (wixWebhookSecret && wixSignature) {
+      if (!verifyHmac(wixWebhookSecret, rawBody, wixSignature)) {
+        console.warn('[Webhook] Wix form: invalid signature — rejecting');
+        return NextResponse.json({ error: 'Invalid webhook signature' }, { status: 401 });
+      }
+    }
+
+    const payload = JSON.parse(rawBody);
+    const wixInstanceId: string = payload.instanceId;
+    const formData = payload.data;
 
     if (!wixInstanceId || !formData) {
       return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
 
-    // Extract fields
-    const email = formData.fields?.find((f: any) => f.name === 'Email' || f.name === 'email')?.value;
-    const firstName = formData.fields?.find((f: any) => f.name === 'First Name' || f.name === 'firstName')?.value;
-    const lastName = formData.fields?.find((f: any) => f.name === 'Last Name' || f.name === 'lastName')?.value;
+        const fields: { name: string; value: string }[] = formData.fields || [];
+    const getField = (names: string[]) =>
+      fields.find(f => names.some(n => n.toLowerCase() === f.name.toLowerCase()))?.value || '';
+
+    const email     = getField(['email', 'Email', 'email address']);
+    const firstName = getField(['first name', 'firstname', 'first_name', 'name']);
+    const lastName  = getField(['last name', 'lastname', 'last_name', 'surname']);
 
     if (!email) {
-      console.warn('Form submission skipped: No email provided.');
-      return NextResponse.json({ success: true, note: 'No email' });
+      console.warn('[Form] Submission skipped: no email field found');
+      return NextResponse.json({ success: true, note: 'no email' });
     }
 
-    // Extract UTM parameters and context (Wix forms usually include this in the `context` or `submissionTime`)
-    // Mocking extraction as it depends on exact Wix form schema
-    const context = formData.context || {};
-    const utmSource = context.utm_source || 'Wix Form';
-    const utmMedium = context.utm_medium || '';
-    const utmCampaign = context.utm_campaign || '';
-    const pageUrl = context.pageUrl || '';
+        const ctx = formData.context || {};
+    const utmSource   = ctx.utm_source   || '';
+    const utmMedium   = ctx.utm_medium   || '';
+    const utmCampaign = ctx.utm_campaign || '';
+    const utmTerm     = ctx.utm_term     || '';
+    const utmContent  = ctx.utm_content  || '';
+    const pageUrl     = ctx.pageUrl      || ctx.page_url || '';
+    const referrer    = ctx.referrer     || ctx.referrerUrl || '';
+    const submittedAt = new Date(formData.submittedAt || Date.now()).toISOString();
 
-    // Push to HubSpot
-    const properties: any = {
+            const properties: Record<string, string> = {
       email,
-      firstname: firstName,
-      lastname: lastName,
-      hs_analytics_source: 'EXTENSION', // or other valid HubSpot source enum
+      ...(firstName && { firstname: firstName }),
+      ...(lastName  && { lastname: lastName }),
+            hs_analytics_source:        utmSource  ? 'OFFLINE'  : 'DIRECT_TRAFFIC',
       hs_analytics_source_data_1: utmSource,
       hs_analytics_source_data_2: utmMedium,
-      message: `Submitted form from ${pageUrl} - Campaign: ${utmCampaign}`
+                  hs_latest_source:           utmSource  || 'Wix Form',
+      hs_latest_source_data_1:    utmSource,
+      hs_latest_source_data_2:    utmMedium,
+            message: [
+        `Source: ${utmSource || 'direct'}`,
+        `Medium: ${utmMedium || 'none'}`,
+        `Campaign: ${utmCampaign || 'none'}`,
+        `Term: ${utmTerm || 'none'}`,
+        `Content: ${utmContent || 'none'}`,
+        `Page: ${pageUrl}`,
+        `Referrer: ${referrer}`,
+        `Submitted: ${submittedAt}`,
+      ].join(' | '),
     };
 
-    // Clean up undefined properties
-    Object.keys(properties).forEach(key => {
-      if (properties[key] === undefined) delete properties[key];
-    });
+        for (const k of Object.keys(properties)) {
+      if (!properties[k]) delete properties[k];
+    }
 
-    // We can use the Contacts API to upsert (create or update based on email)
-    // Actually, HubSpot offers a specific endpoint for upserting by email: 
-    // POST /crm/v3/objects/contacts/search to find, then PATCH, or just use forms API.
-    // For this assignment, we'll try to find by email and then create/update.
-    
-    let hubspotContactId;
-    const searchRes = await hubspotApi(wixInstanceId, `/crm/v3/objects/contacts/search`, {
+        let hubspotContactId: string | undefined;
+    const searchRes = await hubspotApi(wixInstanceId, '/crm/v3/objects/contacts/search', {
       method: 'POST',
       body: JSON.stringify({
-        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }]
-      })
+        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
+      }),
     });
-    
+
     if (searchRes.ok) {
       const searchData = await searchRes.json();
-      if (searchData.total > 0) {
-        hubspotContactId = searchData.results[0].id;
-      }
+      if (searchData.total > 0) hubspotContactId = searchData.results[0].id;
     }
 
-    let endpoint = '/crm/v3/objects/contacts';
-    let method = 'POST';
-    
-    if (hubspotContactId) {
-      endpoint = `/crm/v3/objects/contacts/${hubspotContactId}`;
-      method = 'PATCH';
-    }
+    const endpoint = hubspotContactId
+      ? `/crm/v3/objects/contacts/${hubspotContactId}`
+      : '/crm/v3/objects/contacts';
+    const method = hubspotContactId ? 'PATCH' : 'POST';
 
     const res = await hubspotApi(wixInstanceId, endpoint, {
       method,
-      body: JSON.stringify({ properties })
+      body: JSON.stringify({ properties }),
     });
 
     if (!res.ok) {
-      console.error('HubSpot Form Capture Error:', await res.text());
+      console.error('[Form] HubSpot upsert failed:', await res.text());
       return NextResponse.json({ error: 'Failed to push to HubSpot' }, { status: 500 });
     }
 
-    return NextResponse.json({ success: true });
+    const result = await res.json();
+    console.log(`[Form] Lead captured → HubSpot contact ${result.id}, utm_source="${utmSource}", page="${pageUrl}"`);
+
+    return NextResponse.json({ success: true, hubspotContactId: result.id });
   } catch (error) {
-    console.error('Wix form webhook error:', error);
+    console.error('[Webhook] Wix form error:', error);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }

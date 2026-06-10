@@ -1,171 +1,216 @@
 import { getDb } from './db';
 import { hubspotApi } from './hubspot';
+import { hashProps } from './crypto';
+import {
+  findWixContactByEmail,
+  createWixContact,
+  updateWixContact,
+  buildWixPayload,
+} from './wix';
 
-export async function syncWixToHubSpot(wixInstanceId: string, wixContactId: string, wixContactData: any) {
+/** Apply field transform based on mapping config */
+function applyTransform(value: string, transform: string): string {
+  switch (transform) {
+    case 'trim':          return value.trim();
+    case 'lowercase':     return value.toLowerCase();
+    case 'trim_lowercase':return value.trim().toLowerCase();
+    default:              return value;
+  }
+}
+
+/** Extract a value from a nested object using a dot/bracket path like 'emails[0].email' */
+function extractByPath(obj: any, path: string): string | undefined {
+  let val = obj;
+  for (const part of path.split('.')) {
+    if (!val) return undefined;
+    const arrayMatch = part.match(/^(.*)\[(\d+)\]$/);
+    if (arrayMatch) {
+      val = val[arrayMatch[1]]?.[parseInt(arrayMatch[2], 10)];
+    } else {
+      val = val[part];
+    }
+  }
+  return val !== undefined ? String(val) : undefined;
+}
+
+// Wix → HubSpot
+export async function syncWixToHubSpot(
+  wixInstanceId: string,
+  wixContactId: string,
+  wixContactData: any,
+  wixUpdatedAt: number = Date.now()
+) {
   const db = await getDb();
 
-  // 1. Check infinite loop: Did we just update this contact from HubSpot?
-  const syncState = await db.get(
-    'SELECT lastSyncedAt, lastSource FROM sync_state WHERE wixContactId = ? AND wixInstanceId = ?',
+    const syncState = await db.get(
+    'SELECT * FROM sync_state WHERE wixContactId = ? AND wixInstanceId = ?',
     [wixContactId, wixInstanceId]
   );
-  
-  if (syncState && syncState.lastSource === 'HUBSPOT_TO_WIX') {
-    // If it was synced very recently (e.g. last 10 seconds), ignore this echo
-    if (Date.now() - syncState.lastSyncedAt < 10000) {
-      console.log('Ignoring echo from HubSpot to Wix sync.');
+
+  if (syncState?.lastSource === 'HUBSPOT_TO_WIX') {
+    if (Date.now() - syncState.lastSyncedAt < 15000) {
+      console.log('[Sync] Skipping Wix→HS echo (within dedup window)');
       return;
     }
   }
 
-  // 2. Load mappings
-  const mappings = await db.all(
-    "SELECT wixField, hubspotProperty FROM mappings WHERE wixInstanceId = ? AND direction IN ('WIX_TO_HUBSPOT', 'BIDIRECTIONAL')",
-    [wixInstanceId]
-  );
-
-  if (mappings.length === 0) return;
-
-  // 3. Translate properties
-  const properties: Record<string, string> = {};
-  for (const m of mappings) {
-    // Basic extraction (handling simple and basic array paths like emails[0].email)
-    let val = wixContactData;
-    const parts = m.wixField.split('.');
-    for (const part of parts) {
-      if (!val) break;
-      const arrayMatch = part.match(/(.*)\[(\d+)\]/);
-      if (arrayMatch) {
-        const arrName = arrayMatch[1];
-        const arrIdx = parseInt(arrayMatch[2], 10);
-        val = val[arrName] ? val[arrName][arrIdx] : undefined;
-      } else {
-        val = val[part];
-      }
-    }
-    if (val !== undefined) {
-      properties[m.hubspotProperty] = String(val);
-    }
+    if (syncState && wixUpdatedAt < syncState.hsUpdatedAt) {
+    console.log('[Sync] Skipping Wix→HS: HubSpot version is newer');
+    return;
   }
 
-  // If no properties to sync, skip
+    const mappings = await db.all(
+    `SELECT wixField, hubspotProperty, transform
+     FROM mappings
+     WHERE wixInstanceId = ? AND direction IN ('WIX_TO_HUBSPOT', 'BIDIRECTIONAL')`,
+    [wixInstanceId]
+  );
+  if (mappings.length === 0) return;
+
+    const properties: Record<string, string> = {};
+  for (const m of mappings) {
+    const raw = extractByPath(wixContactData, m.wixField);
+    if (raw !== undefined) {
+      properties[m.hubspotProperty] = applyTransform(raw, m.transform || 'none');
+    }
+  }
   if (Object.keys(properties).length === 0) return;
 
-  // 4. Upsert to HubSpot
-  let hubspotContactId = syncState?.hubspotContactId;
-  
-  // If we don't know the hubspotContactId, we try to create, or search by email first
+    const newHash = hashProps(properties);
+  if (syncState?.lastWixHash === newHash) {
+    console.log('[Sync] Skipping Wix→HS: values unchanged (idempotent)');
+    return;
+  }
+
+    let hubspotContactId: string | undefined = syncState?.hubspotContactId;
+
   if (!hubspotContactId && properties.email) {
-    const searchRes = await hubspotApi(wixInstanceId, `/crm/v3/objects/contacts/search`, {
+    const searchRes = await hubspotApi(wixInstanceId, '/crm/v3/objects/contacts/search', {
       method: 'POST',
       body: JSON.stringify({
-        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: properties.email }] }]
-      })
+        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: properties.email }] }],
+      }),
     });
     if (searchRes.ok) {
       const searchData = await searchRes.json();
-      if (searchData.total > 0) {
-        hubspotContactId = searchData.results[0].id;
-      }
+      if (searchData.total > 0) hubspotContactId = searchData.results[0].id;
     }
   }
 
-  let endpoint = '/crm/v3/objects/contacts';
-  let method = 'POST';
-  
-  if (hubspotContactId) {
-    endpoint = `/crm/v3/objects/contacts/${hubspotContactId}`;
-    method = 'PATCH';
-  }
+  const endpoint = hubspotContactId
+    ? `/crm/v3/objects/contacts/${hubspotContactId}`
+    : '/crm/v3/objects/contacts';
+  const method = hubspotContactId ? 'PATCH' : 'POST';
 
   const res = await hubspotApi(wixInstanceId, endpoint, {
     method,
-    body: JSON.stringify({ properties })
+    body: JSON.stringify({ properties }),
   });
 
   if (!res.ok) {
-    console.error('HubSpot Sync Error:', await res.text());
+    console.error('[Sync] HubSpot upsert failed:', await res.text());
     return;
   }
 
   const data = await res.json();
   hubspotContactId = data.id;
 
-  // 5. Update Sync State
-  await db.run(
-    `INSERT INTO sync_state (wixContactId, hubspotContactId, wixInstanceId, lastSyncedAt, lastSource)
-     VALUES (?, ?, ?, ?, ?)
+    await db.run(
+    `INSERT INTO sync_state
+       (wixContactId, hubspotContactId, wixInstanceId, lastSyncedAt, lastSource, wixUpdatedAt, lastWixHash)
+     VALUES (?, ?, ?, ?, 'WIX_TO_HUBSPOT', ?, ?)
      ON CONFLICT(wixContactId, hubspotContactId) DO UPDATE SET
-     lastSyncedAt=excluded.lastSyncedAt, lastSource=excluded.lastSource`,
-    [wixContactId, hubspotContactId, wixInstanceId, Date.now(), 'WIX_TO_HUBSPOT']
+       lastSyncedAt  = excluded.lastSyncedAt,
+       lastSource    = excluded.lastSource,
+       wixUpdatedAt  = excluded.wixUpdatedAt,
+       lastWixHash   = excluded.lastWixHash`,
+    [wixContactId, hubspotContactId, wixInstanceId, Date.now(), wixUpdatedAt, newHash]
   );
+
+  console.log(`[Sync] Wix→HubSpot complete: wix=${wixContactId} → hs=${hubspotContactId}`);
 }
 
-export async function syncHubSpotToWix(wixInstanceId: string, hubspotContactId: string, hubspotProperties: any) {
+// HubSpot → Wix
+export async function syncHubSpotToWix(
+  wixInstanceId: string,
+  hubspotContactId: string,
+  hubspotProperties: Record<string, string>,
+  hsUpdatedAt: number = Date.now()
+) {
   const db = await getDb();
 
-  // 1. Check infinite loop
-  const syncState = await db.get(
-    'SELECT wixContactId, lastSyncedAt, lastSource FROM sync_state WHERE hubspotContactId = ? AND wixInstanceId = ?',
+    const syncState = await db.get(
+    'SELECT * FROM sync_state WHERE hubspotContactId = ? AND wixInstanceId = ?',
     [hubspotContactId, wixInstanceId]
   );
-  
-  if (syncState && syncState.lastSource === 'WIX_TO_HUBSPOT') {
-    if (Date.now() - syncState.lastSyncedAt < 10000) {
-      console.log('Ignoring echo from Wix to HubSpot sync.');
+
+  if (syncState?.lastSource === 'WIX_TO_HUBSPOT') {
+    if (Date.now() - syncState.lastSyncedAt < 15000) {
+      console.log('[Sync] Skipping HS→Wix echo (within dedup window)');
       return;
     }
   }
 
-  // 2. Load mappings
-  const mappings = await db.all(
-    "SELECT wixField, hubspotProperty FROM mappings WHERE wixInstanceId = ? AND direction IN ('HUBSPOT_TO_WIX', 'BIDIRECTIONAL')",
+    if (syncState && hsUpdatedAt < syncState.wixUpdatedAt) {
+    console.log('[Sync] Skipping HS→Wix: Wix version is newer');
+    return;
+  }
+
+    const mappings = await db.all(
+    `SELECT wixField, hubspotProperty, transform
+     FROM mappings
+     WHERE wixInstanceId = ? AND direction IN ('HUBSPOT_TO_WIX', 'BIDIRECTIONAL')`,
     [wixInstanceId]
   );
-
   if (mappings.length === 0) return;
 
-  // 3. Translate properties
-  const wixPayload: any = {};
+    const wixFieldMap: Record<string, string> = {};
   for (const m of mappings) {
     if (hubspotProperties[m.hubspotProperty] !== undefined) {
-      // Very basic structural build for Wix based on the path
-      const parts = m.wixField.split('.');
-      if (parts[0] === 'emails' && parts[1] === '[0].email') {
-        wixPayload.emails = wixPayload.emails || [];
-        wixPayload.emails[0] = { email: hubspotProperties[m.hubspotProperty], tag: 'MAIN' };
-      } else if (parts[0] === 'phones' && parts[1] === '[0].phone') {
-        wixPayload.phones = wixPayload.phones || [];
-        wixPayload.phones[0] = { phone: hubspotProperties[m.hubspotProperty], tag: 'MAIN' };
-      } else if (parts[0] === 'name') {
-        wixPayload.name = wixPayload.name || {};
-        if (parts[1] === 'first') wixPayload.name.first = hubspotProperties[m.hubspotProperty];
-        if (parts[1] === 'last') wixPayload.name.last = hubspotProperties[m.hubspotProperty];
-      } else {
-        wixPayload[m.wixField] = hubspotProperties[m.hubspotProperty];
-      }
+      wixFieldMap[m.wixField] = applyTransform(hubspotProperties[m.hubspotProperty], m.transform || 'none');
+    }
+  }
+  if (Object.keys(wixFieldMap).length === 0) return;
+
+    const newHash = hashProps(wixFieldMap);
+  if (syncState?.lastHsHash === newHash) {
+    console.log('[Sync] Skipping HS→Wix: values unchanged (idempotent)');
+    return;
+  }
+
+    const payload = buildWixPayload(wixFieldMap);
+  let wixContactId: string | undefined = syncState?.wixContactId;
+
+  if (wixContactId) {
+    await updateWixContact(wixContactId, payload);
+  } else {
+    // Try to find by email first
+    const email = wixFieldMap['emails[0].email'];
+    if (email) wixContactId = (await findWixContactByEmail(email)) ?? undefined;
+
+    if (wixContactId) {
+      await updateWixContact(wixContactId, payload);
+    } else {
+      wixContactId = (await createWixContact(payload)) ?? undefined;
     }
   }
 
-  if (Object.keys(wixPayload).length === 0) return;
-
-  // 4. Upsert to Wix
-  // In a real app we'd use Wix SDK with wixInstanceId / offline token.
-  // Here we mock the API request to Wix since we don't have the real Wix credentials/SDK configured.
-  let wixContactId = syncState?.wixContactId;
-
-  console.log('Mock: Syncing to Wix Contact API:', { wixContactId, payload: wixPayload });
   if (!wixContactId) {
-    // Mock creating a wix contact ID
-    wixContactId = 'wix-c-' + Math.random().toString(36).substring(7);
+    console.error('[Sync] Failed to upsert Wix contact');
+    return;
   }
 
-  // 5. Update Sync State
-  await db.run(
-    `INSERT INTO sync_state (wixContactId, hubspotContactId, wixInstanceId, lastSyncedAt, lastSource)
-     VALUES (?, ?, ?, ?, ?)
+    await db.run(
+    `INSERT INTO sync_state
+       (wixContactId, hubspotContactId, wixInstanceId, lastSyncedAt, lastSource, hsUpdatedAt, lastHsHash)
+     VALUES (?, ?, ?, ?, 'HUBSPOT_TO_WIX', ?, ?)
      ON CONFLICT(wixContactId, hubspotContactId) DO UPDATE SET
-     lastSyncedAt=excluded.lastSyncedAt, lastSource=excluded.lastSource`,
-    [wixContactId, hubspotContactId, wixInstanceId, Date.now(), 'HUBSPOT_TO_WIX']
+       lastSyncedAt = excluded.lastSyncedAt,
+       lastSource   = excluded.lastSource,
+       hsUpdatedAt  = excluded.hsUpdatedAt,
+       lastHsHash   = excluded.lastHsHash`,
+    [wixContactId, hubspotContactId, wixInstanceId, Date.now(), hsUpdatedAt, newHash]
   );
+
+  console.log(`[Sync] HubSpot→Wix complete: hs=${hubspotContactId} → wix=${wixContactId}`);
 }
